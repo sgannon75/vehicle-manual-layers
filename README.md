@@ -39,7 +39,25 @@ python skills/vehicle-manual-layers/scripts/extract_manual.py \
 
 Requires Python 3 and `pypdf`.
 
-4. Point Layer 1 at Layer 2. Verify one control (parking brake, Auto Hold, a warning light) before you trust it.
+Optional source metadata: add `--edition "2026 edition" --market "US"`.
+The manifest records the source PDF SHA-256. Bookmark splits use page-window
+fallback so `--max-pages` (default 90) is enforced even without bookmarks.
+
+Regeneration preserves unrelated Markdown and refuses to overwrite edited or
+untracked files with matching names. For extracts made with the old script, use
+a fresh output folder and inspect it before switching your vehicle skill over.
+Extraction completes in staging before generated files are replaced; caught
+publication errors roll back prior bytes. Do not run concurrent extractions into
+the same folder. A process or machine crash is not a directory-wide transaction.
+
+4. Point Layer 1 at Layer 2. Verify a warning, a figure-dependent control, and a table or multi-column passage against the actual PDF. Inspect sparse-page flags; mixed scanned/text PDFs may need partial OCR. Keep source pages on distilled facts and separate owner preferences from manufacturer recommendations.
+
+## Tests
+
+Install `pypdf`, then run `python -m unittest discover -s tests -v`.
+Tests use synthetic content only; no OEM manual is included. They cover page
+coverage, size limits, sparse text, safe regeneration, and publication rollback.
+Real-manual visual checks remain necessary for diagrams and reading order.
 
 ## What not to publish
 

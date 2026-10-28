@@ -27,7 +27,7 @@ Do **not** use this to scrape manufacturer websites into a public skill.
 
 ## The three layers
 
-Stop at the first layer that answers.
+Stop at the first layer that answers routine questions. For safety-sensitive procedures, warning lights, towing, jacking, or specifications, check the source passage for conditions and warnings even if Layer 1 appears to answer. Inspect the PDF whenever layout, tables, or figures could affect meaning.
 
 1. **`SKILL.md` (Layer 1)** — standing facts for *this* vehicle (year, trim, fuel, charge limits, seating) plus a short distilled index. Loaded every time the vehicle skill is used. Keep it small.
 2. **`references/*.md` (Layer 2)** — full text extract, one file per manual chapter (split a 200+ page chapter). Search it. Cite `<!-- pdf-page N -->`.
@@ -48,7 +48,8 @@ Never fill a gap from manufacturer sites, forums, or fueleconomy.gov for how *th
 New skill named for the vehicle (`make-model-year-manual`). Copy `templates/vehicle-skill.md` and fill:
 
 - Year, make, model, powertrain (gas / PHEV / EV)
-- Owner-specific facts (fuel grade, charge cap, seating)
+- Manufacturer facts with source pages (fuel grade, charging recommendations), separately from owner-confirmed equipment and preferences (seating, preferred charge cap). Record unknowns rather than guessing.
+- Manual edition, market/region, and SHA-256 from the extraction manifest; confirm the manual applies to this vehicle.
 - Absolute PDF path
 - Rule: Layer 1 → search `references/` → PDF page in the marker
 - Rule: do not web-search this car's operation
@@ -66,10 +67,12 @@ python scripts/extract_manual.py --pdf "/path/to/manual.pdf" --out "/path/to/veh
 The script:
 
 - Walks PDF bookmarks for top-level chapters
-- Splits any chapter longer than `--max-pages` at second-level bookmarks
+- Uses nested bookmarks where possible, with page-window fallback to enforce `--max-pages` and cover every page exactly once; works without bookmarks
 - Writes `00-manifest.md` plus `NN-slug.md` with `<!-- pdf-page N / printed -->` markers
-- Marks near-empty pages as `[figure omitted — see PDF page N]`
+- Preserves sparse text and flags pages with little or no extracted text for PDF inspection or OCR; this does not prove a figure exists
 - Does not OCR
+- Stages extraction before publication, tracks generated files and their hashes, and refuses to overwrite untracked or edited files. Use a fresh folder to migrate old untracked extracts. Individual replacements are atomic, with rollback on caught errors; interruption or concurrent runs are not supported as a transaction.
+- Records source path, SHA-256, edition and market (`--edition` and `--market`) in the manifest
 
 Copy the script into the vehicle skill's `scripts/` if you want that car to re-extract without this factory skill. Re-run after a new manual edition.
 
@@ -87,7 +90,9 @@ Pick a control the distilled notes under-specify (parking brake, Auto Hold, a wa
 
 - Layer 2 search hits the right chapter file
 - A `<!-- pdf-page N -->` marker exists
-- Step numbers that sit on a drawing are blank in Markdown (that is Layer 3 working, not a bug)
+- Inspect the actual PDF page and verify the answer preserves step order, conditions, warnings, and applicability; missing text is a reason to inspect, never proof of correctness
+- Check at least one warning, one figure-dependent control, and one table or multi-column passage. Review sparse-page flags throughout the extract; a text-bearing middle page does not rule out scanned pages elsewhere. OCR or inspect affected pages before relying on them.
+- Present citations as "Owner's Manual, PDF page N (printed X when available)" rather than exposing HTML comments. The PDF page is one-based; viewer APIs may require a zero-based index.
 
 ### 5. Keep cars isolated
 
@@ -100,6 +105,8 @@ Facts that are **this car**, not the whole book:
 - Fuel (regular vs premium), charge limits, seating (captains vs bench)
 - "Do not web-search" and the PDF path
 - Short how-to that is used weekly
+
+Every distilled manufacturer fact or how-to needs a source page and applicable conditions. Keep owner preferences separate from manufacturer recommendations. If the PDF hash changes, re-extract and reverify Layer 1 before using cached facts.
 
 If a procedure needs warnings, conditions, or cancel rules, leave it in Layer 2.
 

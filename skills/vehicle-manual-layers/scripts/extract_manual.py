@@ -8,7 +8,11 @@ Requires a text-layer PDF. Does not OCR. Does not fetch the web.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
+import tempfile
+import os
 import unicodedata
 from pathlib import Path
 
@@ -94,44 +98,103 @@ def extract_range(reader: PdfReader, start: int, end: int) -> str:
             marker += f" / {printed}"
         marker += " -->"
         if len(body) < 40:
-            parts.append(f"{marker}\n\n[figure omitted — see PDF page {pdf_page}]\n")
+            parts.append(f"{marker}\n\n{body}\n\n[little or no text extracted — inspect PDF page {pdf_page}; OCR may be needed]\n")
         else:
             parts.append(f"{marker}\n\n{body}\n")
     return "\n".join(parts).strip() + "\n"
 
 
 def jobs_from_outline(tops, n_pages: int, max_pages: int):
+    if max_pages <= 0:
+        raise ValueError("max-pages must be positive")
+    if n_pages <= 0:
+        raise ValueError("PDF has no pages")
+    # Normalize duplicate/out-of-order destinations; every physical page belongs
+    # to exactly one range. Nested headings supply preferred split boundaries.
+    chapters = {}
+    for chapter in tops:
+        page = chapter["page"]
+        if not 0 <= page < n_pages:
+            raise ValueError(f"Invalid bookmark page: {page}")
+        chapters.setdefault(page, chapter)
+    ordered = sorted(chapters.items())
+    if not ordered or ordered[0][0] > 0:
+        ordered.insert(0, (0, {"title": "Front matter" if ordered else "Manual", "children": []}))
     jobs = []
-    if tops and tops[0]["page"] > 0:
-        jobs.append(("00-front-matter", "Front matter", 0, tops[0]["page"]))
-    for i, ch in enumerate(tops):
-        start = ch["page"]
-        end = tops[i + 1]["page"] if i + 1 < len(tops) else n_pages
-        span = end - start
-        prefix = f"{i + 1:02d}"
-        kids = [k for k in ch["children"] if k["page"] >= start]
-        if span > max_pages and kids:
-            bundles = []
-            b_start, b_title, b_page = 0, kids[0]["title"], kids[0]["page"]
-            for j, kid in enumerate(kids):
-                nxt = kids[j + 1]["page"] if j + 1 < len(kids) else end
-                if j > 0 and (nxt - b_page) > max_pages:
-                    bundles.append((b_title, b_page, kid["page"]))
-                    b_title, b_page = kid["title"], kid["page"]
-                b_start = j
-            bundles.append((b_title, b_page, end))
-            # include chapter intro before first child
-            if bundles[0][1] > start:
-                jobs.append(
-                    (f"{prefix}a-{slugify(ch['title'])}-intro", ch["title"] + " (intro)", start, bundles[0][1])
-                )
-            letters = "abcdefghijklmnopqrstuvwxyz"
-            for k, (title, s, e) in enumerate(bundles):
-                letter = letters[k] if k < len(letters) else str(k)
-                jobs.append((f"{prefix}{letter}-{slugify(title)}", f"{ch['title']}: {title}", s, e))
-        else:
-            jobs.append((f"{prefix}-{slugify(ch['title'])}", ch["title"], start, end))
+    def boundaries(children):
+        for child in children:
+            yield child["page"]
+            yield from boundaries(child["children"])
+    for i, (start, ch) in enumerate(ordered):
+        end = ordered[i + 1][0] if i + 1 < len(ordered) else n_pages
+        cuts = sorted(set(p for p in boundaries(ch["children"]) if start < p < end))
+        part = 1
+        while start < end:
+            stop = min(start + max_pages, end)
+            if stop < end:
+                candidates = [p for p in cuts if start < p <= stop]
+                if candidates:
+                    stop = candidates[-1]
+            slug = f"{i+1:02d}-{part:03d}-{slugify(ch['title'])}"
+            jobs.append((slug, ch["title"], start, stop))
+            start, part = stop, part + 1
+    cursor = 0
+    for _, _, start, end in jobs:
+        if start != cursor or not 0 < end - start <= max_pages:
+            raise ValueError("Invalid page coverage")
+        cursor = end
+    if cursor != n_pages:
+        raise ValueError("Incomplete page coverage")
     return jobs
+
+
+def publish(out: Path, files: dict[str, str], metadata: dict) -> None:
+    """Stage first; only replace tracked, unmodified generated files.
+
+    Each replacement is atomic. A failed multi-file publication rolls back the
+    prior bytes; this is not a crash-atomic directory transaction.
+    """
+    state_name = ".vehicle-manual-generated.json"
+    out.mkdir(parents=True, exist_ok=True)
+    state_path = out / state_name
+    if out.is_symlink() or state_path.is_symlink():
+        raise ValueError("Output and tracking file must not be symlinks")
+    previous = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"files": {}}
+    tracked = previous["files"]
+    for name in set(tracked) | set(files):
+        if Path(name).name != name or not name.endswith(".md") or name == "SKILL.md":
+            raise ValueError(f"Unsafe generated filename: {name}")
+        target = out / name
+        if target.is_symlink():
+            raise ValueError(f"Refusing symlink: {name}")
+        if target.exists():
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if tracked.get(name) != digest:
+                raise ValueError(f"Preserving untracked or edited file: {name}; use a fresh output folder")
+    encoded = {name: body.encode("utf-8") for name, body in files.items()}
+    metadata["files"] = {name: hashlib.sha256(body).hexdigest() for name, body in encoded.items()}
+    encoded[state_name] = (json.dumps(metadata, indent=2) + "\n").encode("utf-8")
+    names = set(tracked) | set(encoded)
+    backup = {name: (out / name).read_bytes() if (out / name).exists() else None for name in names}
+    with tempfile.TemporaryDirectory(prefix=".manual-stage-", dir=out.parent) as staging:
+        stage = Path(staging)
+        for name, body in encoded.items():
+            (stage / name).write_bytes(body)
+        try:
+            for name in encoded:
+                if name != state_name:
+                    os.replace(stage / name, out / name)
+            for name in set(tracked) - set(files):
+                (out / name).unlink(missing_ok=True)
+            os.replace(stage / state_name, state_path)
+        except Exception:
+            for name, body in backup.items():
+                if body is None:
+                    (out / name).unlink(missing_ok=True)
+                else:
+                    (stage / name).write_bytes(body)
+                    os.replace(stage / name, out / name)
+            raise
 
 
 def main() -> None:
@@ -139,27 +202,30 @@ def main() -> None:
     ap.add_argument("--pdf", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--max-pages", type=int, default=90)
+    ap.add_argument("--edition", default="unspecified")
+    ap.add_argument("--market", default="unspecified")
     args = ap.parse_args()
+    if args.max_pages <= 0:
+        ap.error("--max-pages must be positive")
     pdf = args.pdf.expanduser().resolve()
     if not pdf.exists():
         raise SystemExit(f"PDF not found: {pdf}")
     reader = PdfReader(str(pdf))
     n = len(reader.pages)
     tops = walk(reader.outline, reader)
-    if not tops:
-        raise SystemExit("No PDF bookmarks. Add an outline or split by hand.")
 
     out = args.out.expanduser().resolve()
-    out.mkdir(parents=True, exist_ok=True)
-    for old in out.glob("*.md"):
-        old.unlink()
-
     jobs = jobs_from_outline(tops, n, args.max_pages)
+    fingerprint = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    files = {}
     manifest = [
         "# Manual - Layer 2 file map",
         "",
         f"Source PDF: `{pdf}`",
         f"PDF pages: {n}",
+        f"SHA-256: `{fingerprint}`",
+        f"Edition: {args.edition}; market/region: {args.market}",
+        "Splitting: bookmarks with page-window fallback" if tops else "Splitting: page windows (no bookmarks)",
         "",
         "Lookup: Layer 1 SKILL.md -> this folder -> Layer 3 the PDF page in the marker.",
         "",
@@ -178,13 +244,15 @@ def main() -> None:
             f"---\n\n"
         )
         path = out / f"{slug}.md"
-        path.write_text(header + body, encoding="utf-8")
+        files[path.name] = header + body
         manifest.append(f"| `{slug}.md` | {title} | {start + 1}-{end} |")
-        print(f"wrote {path.name:42} pages {start+1:3}-{end:<3}  {path.stat().st_size:7} bytes")
+        print(f"prepared {path.name:42} pages {start+1:3}-{end:<3}")
 
     manifest.append("")
     manifest.append("Re-extract: python scripts/extract_manual.py --pdf <pdf> --out references")
-    (out / "00-manifest.md").write_text("\n".join(manifest) + "\n", encoding="utf-8")
+    files["00-manifest.md"] = "\n".join(manifest) + "\n"
+    publish(out, files, {"source_pdf": str(pdf), "sha256": fingerprint,
+                         "edition": args.edition, "market": args.market})
     print("files", len(jobs), "pages", n)
 
 
